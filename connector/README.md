@@ -135,8 +135,8 @@ atomic file transactions and legacy migration.
 
 ## Runtime Discovery
 
-The default providers are Codex, Claude and DSH. The connector reports attached runtime
-capabilities to the server. Codex is discovered through the official
+The default providers are Codex, Claude, DSH and ACP. The connector reports attached
+runtime capabilities to the server. Codex is discovered through the official
 `openai-codex` SDK package; the connector does not use a Codex CLI/app-server
 path or IPC switch as an active runtime surface. If Claude Code is not on
 `PATH`, set:
@@ -146,15 +146,26 @@ CLAUDE_BIN=/path/to/claude
 ```
 
 DSH requires the bridge integration described in
-[DSH Bridge Next](../dsh-bridge-next/README.md). Legacy ACP adapters are not part
-of the default provider registry.
+[DSH Bridge Next](../dsh-bridge-next/README.md).
+
+The ACP provider drives any [Agent Client Protocol](https://agentclientprotocol.com)
+agent over stdio. It ships with a Hermes preset (`hermes-acp`, or `hermes acp`),
+so a Hermes install on the same machine as the connector is usable from the
+phone out of the box; a `custom` preset accepts any ACP agent by command line.
+One ACP process is spawned per runtime instance and multiplexes all its
+sessions. The adapter maps ACP `session/update` events (message and thought
+streaming, tool calls, usage) onto the connector timeline, bridges ACP
+`session/request_permission` approval requests into blocking interactions, and
+recovers the agent process with a restart loop (sessions persist in the agent's
+home and are reopened with `session/load`). Configure the agent home, command
+and timeouts in the runtime config dialog.
 
 Connected sessions expose native slash commands through a live runtime catalog.
 See [runtime slash commands](docs/runtime-commands.md) for Codex commands, DSH
 registry behavior, result states and headless verification.
 
 The connector uses local runtime credentials and local filesystem permissions.
-Agents Anywhere does not proxy Claude or Codex account credentials.
+Agents Anywhere does not proxy Claude, Codex or ACP account credentials.
 
 ## API Namespace
 
