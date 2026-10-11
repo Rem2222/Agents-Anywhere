@@ -310,10 +310,10 @@ class AcpRuntime(AgentRuntime):
         ext_id = external_session_id or self._resolve_external_id(session_id)
         if ext_id is None:
             return None
-        platform_id = self._platform_session_id(ext_id)
+        state = self._session_state(ext_id)
         status = self._session_status.get(ext_id, "idle")
         return SessionState(
-            session_id=platform_id,
+            session_id=state.session_id,
             external_session_id=ext_id,
             runtime="acp",
             status=status,  # type: ignore[arg-type]
@@ -355,6 +355,10 @@ class AcpRuntime(AgentRuntime):
         ext_id = response.get("sessionId")
         if not isinstance(ext_id, str) or not ext_id:
             raise RuntimeUpstreamError("ACP session/new returned no session id")
+        # Bind the server-assigned platform id to this upstream session so all
+        # background notifications (state/timeline/meta) carry the server's id,
+        # not a self-generated sess_acp_* one.
+        self._sessions[ext_id] = AcpSessionState(session_id, ext_id)
         await self.host.session_meta_upsert(
             session_id=session_id,
             runtime="acp",
@@ -421,7 +425,15 @@ class AcpRuntime(AgentRuntime):
         calls.append(TurnEndedCall(turn_id=turn_id, outcome="completed"))
         await self._apply(state.session_id, external_session_id, calls)
         await self.host.session_state_update(session_id, "acp", status="idle", external_session_id=external_session_id)
-        return RuntimeOperationResult(result=dict(response) if isinstance(response, dict) else {})
+        # The upstream ACP response sessionId is the *external* id; the platform
+        # binding is keyed by the server-assigned session_id. Return the platform
+        # identity so the server-side binding check passes, and expose the
+        # upstream id separately.
+        result = dict(response) if isinstance(response, dict) else {}
+        result.pop("sessionId", None)
+        result["sessionId"] = session_id
+        result["externalSessionId"] = external_session_id
+        return RuntimeOperationResult(result=result)
 
     async def interrupt_session(
         self,
