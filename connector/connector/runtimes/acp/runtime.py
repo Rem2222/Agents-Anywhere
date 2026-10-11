@@ -78,6 +78,7 @@ class AcpRuntime(AgentRuntime):
         self._stopping = False
         self._restart_task: asyncio.Task[None] | None = None
         self._idle_task: asyncio.Task[None] | None = None
+        self._resync_task: asyncio.Task[None] | None = None
         self._sessions: dict[str, AcpSessionState] = {}
         self._loads: dict[str, _LoadCapture] = {}
         self._active_turns: set[str] = set()
@@ -116,6 +117,7 @@ class AcpRuntime(AgentRuntime):
             await self._ensure_client()
             if values["idleTimeoutSeconds"]:
                 self._idle_task = asyncio.create_task(self._idle_loop())
+            self._resync_task = asyncio.create_task(self._resync_after_start())
         except (OSError, RuntimeError, ValueError, TimeoutError):
             with suppress(Exception):
                 await self.host.runtime_health_update(
@@ -124,8 +126,24 @@ class AcpRuntime(AgentRuntime):
                 )
             self._schedule_restart()
 
+    async def _resync_after_start(self) -> None:
+        # ACP is an events-mode runtime: the periodic sync loop skips it, so a
+        # fresh connector (or a runtime restart) would never surface existing
+        # sessions until live activity touches them. Publish the full
+        # session/list inventory once the agent is up.
+        try:
+            await self.resynchronize()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - recovery is best-effort
+            logger.exception("acp runtime initial resynchronize failed")
+
     async def stop(self) -> None:
         self._stopping = True
+        if getattr(self, "_resync_task", None) is not None:
+            self._resync_task.cancel()
+            await asyncio.gather(self._resync_task, return_exceptions=True)
+            self._resync_task = None
         if getattr(self, "_idle_task", None) is not None:
             self._idle_task.cancel()
             await asyncio.gather(self._idle_task, return_exceptions=True)
@@ -213,6 +231,43 @@ class AcpRuntime(AgentRuntime):
             self._sessions[external_session_id] = state
         return state
 
+    async def resynchronize(
+        self,
+        session_id: str | None = None,
+        external_session_id: str | None = None,
+    ) -> None:
+        """Event-stream recalibration: republish the full session inventory.
+
+        ACP stays in events sync mode, so the periodic sync loop skips it; the
+        platform discovers sessions only through live ``session/update``
+        notifications. On connector reconnect, republish every session the agent
+        reports via ``session/list`` so existing sessions resurface on the
+        dashboard without waiting for new activity.
+        """
+        if session_id is not None:
+            return
+        sessions = await self.list_complete_session_inventory(page_size=100, force=False)
+        for meta in sessions:
+            try:
+                await self.host.session_meta_upsert(
+                    session_id=meta.session_id,
+                    runtime="acp",
+                    external_session_id=meta.external_session_id,
+                    title=meta.title,
+                    cwd=meta.cwd,
+                    ordering_time=meta.ordering_time,
+                )
+            except Exception:  # noqa: BLE001 - one bad session must not abort the inventory
+                logger.exception(
+                    "acp resynchronize session meta failed session_id={} external_session_id={}",
+                    meta.session_id,
+                    meta.external_session_id,
+                )
+        logger.info(
+            "acp runtime resynchronized sessions={}",
+            len(sessions),
+        )
+
     async def list_sessions(
         self,
         limit: int = 100,
@@ -260,7 +315,7 @@ class AcpRuntime(AgentRuntime):
                     external_session_id=ext_id,
                     runtime="acp",
                     title=raw.get("title") if isinstance(raw.get("title"), str) else None,
-                    cwd=raw.get("cwd") if isinstance(raw.get("cwd"), str) else None,
+                    cwd=self._normalize_cwd(raw.get("cwd")),
                     ordering_time=raw.get("updatedAt") if isinstance(raw.get("updatedAt"), str) else None,
                 )
             )
